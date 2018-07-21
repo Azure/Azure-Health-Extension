@@ -50,6 +50,12 @@
         "description": "Enter your SQL Backup Storage Account Name."
       }
     },
+    "currentUserObjectId": {
+      "type": "string",
+      "metadata": {
+        "description": "Enter the ID of the user to grant CREATE key permissions to SQL keyvault."
+      }
+    },
     "omsWorkSpaceName": {
       "type": "string",
       "metadata": {
@@ -106,7 +112,6 @@
         "Standard_DS2_v2",
         "Standard_A4_v2"
       ],
-
       "metadata": {
         "description": "The Windows virtual machine size."
       }
@@ -184,7 +189,8 @@
         "enabledForDiskEncryption": true,
         "enabledForTemplateDeployment": false,
         "createMode": "default",
-        "enableSoftDelete": true
+        "enableSoftDelete": true,
+        "enablePurgeProtection": true
       },
       "dependsOn": [
         "[concat('Microsoft.Security/pricings/', resourceGroup().name)]"
@@ -207,7 +213,14 @@
             "tenantId": "[subscription().tenantId]",
             "objectId": "[parameters('sqlaadApplicationServiceId')]",
             "permissions": {
-              "keys": [ "encrypt", "decrypt", "wrapKey", "unwrapKey", "sign", "verify" ]
+              "keys": [ "get", "list", "wrapKey", "unwrapKey" ]
+            }
+          },
+          {
+            "tenantId": "[subscription().tenantId]",
+            "objectId": "[parameters('currentUserObjectId')]",
+            "permissions": {
+              "keys": [ "create" ]
             }
           }
         ],
@@ -215,7 +228,8 @@
         "enabledForDiskEncryption": false,
         "enabledForTemplateDeployment": false,
         "createMode": "default",
-        "enableSoftDelete": true
+        "enableSoftDelete": true,
+        "enablePurgeProtection": true
       },
       "dependsOn": [
         "[concat('Microsoft.Security/pricings/', resourceGroup().name)]"
@@ -394,10 +408,7 @@
         "displayName": "[concat(parameters('vmName'), '-PublicIpAddress')]"
       },
       "properties": {
-        "publicIPAllocationMethod": "[variables('publicIPAddressType')]",
-        "dnsSettings": {
-          "domainNameLabel": "[toLower(parameters('vmName'))]"
-        }
+        "publicIPAllocationMethod": "[variables('publicIPAddressType')]"
       }
     },
 
@@ -648,7 +659,7 @@
           }
         },
 
-   {
+        {
           "apiVersion": "2015-06-15",
           "type": "Microsoft.Compute/virtualMachines/extensions",
           "name": "[concat(parameters('vmName'), '/SqlIaasExtension')]",
@@ -669,9 +680,21 @@
                 "MaintenanceWindowStartingHour": "23",
                 "MaintenanceWindowDuration": "60"
               },
+              "AutoBackupSettings": {
+                "Enable": true,
+                "RetentionPeriod": "30",
+                "EnableEncryption": true,
+                "BackupSystemDbs": true,
+                "BackupScheduleType": "Automated"
+              },
               "AutoTelemetrySettings": {
                 "Region": "[resourceGroup().location]"
               }
+            },
+            "protectedSettings": {
+              "StorageUrl": "[reference(resourceId('Microsoft.Storage/storageAccounts', parameters('sqlBackupStorageAccountName')), '2015-06-15').primaryEndpoints['blob']]",
+              "StorageAccessKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', parameters('sqlBackupStorageAccountName')), '2015-06-15').key1]",
+              "Password": "[parameters('sqlAutobackupEncryptionPassword')]"
             }
           }
         },

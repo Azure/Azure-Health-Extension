@@ -373,8 +373,16 @@ else {
     ### Set Deployment password if not already set.
     if ($deploymentPassword -eq 'null') {
         log "Deployment password not provided. Creating password for deployment."
-        $deploymentPassword = New-RandomPassword
-        log "Deployment password $deploymentPassword generated."
+        $guid = New-Guid
+        $guid = $guid.Guid.Substring(0, 16)
+
+        Add-Type -AssemblyName System.web
+        $generated_password = [System.Web.Security.Membership]::GeneratePassword(16,4)
+
+        $deploymentPassword = $guid + $generated_password
+        Write-Host "Generated deployment password $deploymentPassword"
+        $guid = $null
+        $generated_password = $null
     }
     
     
@@ -503,6 +511,25 @@ else {
     $SQL_aadappServiceIdguidString = $servicePrincipal.Id.Guid.ToString()
 
     #
+    # determine objectId corresponding to currently running account.
+    # this is used for keyvault access provisioning to ensure the current user can create a key.
+    #
+
+    $currentAzureContext = Get-AzureRmContext
+    $accountId = $currentAzureContext.Account.Id
+
+    $user = Get-AzureRMADUser -SearchString $accountId
+    if( (($user | measure).count) -ne 1 ) {
+        log "Unable to determine current user objectId information."
+        logerror 
+        Break
+    }
+
+    $currentUserObjectId = $user[0].Id.Guid.ToString()
+
+    log "Current user objectId = $($currentUserObjectId)"
+
+    #
     # prepare random password for SQL backups.
     #
 
@@ -530,7 +557,6 @@ else {
     $SqlDbServerName = $ResourceGroupName+'-los-sql-'+$environment
     $SqlDbServerResourceGroup = $ResourceGroupName+'-workload-'+$environment+'-rg'
 
-
     $SqlServerAddress = $SqlDbServerName+'.database.windows.net'
     $VNetName = $ResourceGroupName+'-SQLVM-VNet'
     $SubnetName = 'SQLSubnet'
@@ -538,11 +564,11 @@ else {
     $AdminUserName = $ResourceGroupName+'-admin'
 
     #
-    # credential name cannot be duplicated across SqlIaaSExtension deployments to a given VM.
+    # derive names for credential (on SQL server), and keyname (in key vault)
     #
 
-    $UniqueCredentialNameSuffix = ( ([char[]]([char]97..[char]122)) + 0..9 | sort {Get-Random})[0..7] -join ''
-    $KeyVaultCredentialName = "$($resourceGroupName)-SQL-AKV-Cred-"+$UniqueCredentialNameSuffix
+    $KeyVaultCredentialName = "$($resourceGroupName)SQLAKVCred"
+    $KeyVaultKeyName = "$($resourceGroupName)SQLAKVKey"
 
     $AutoBackupPassword = ConvertTo-SecureString -AsPlainText -Force $sqlAutobackupEncryptionPassword
 
@@ -566,6 +592,7 @@ else {
     $OptionalParameters['sqlaadClientSecret'] = $SQL_aadClientSecret
     $OptionalParameters['sqlAutobackupEncryptionPassword'] = ConvertTo-SecureString -AsPlainText -Force $sqlAutobackupEncryptionPassword
     $OptionalParameters['sqlBackupStorageAccountName'] = $SQL_StorageAccountName
+    $OptionalParameters['currentUserObjectId'] = $currentUserObjectId
     $OptionalParameters['omsWorkSpaceName'] = $workSpaceName
     if($omsServiceTier -ne $null) {
         $OptionalParameters['omsServiceTier'] = $omsServiceTier
@@ -600,14 +627,14 @@ else {
         # update PaaS firewall and access policy
         #
 
-        $status = Update-SqlIaaSExtensionBackupAndKeyVault -resourceGroupName $ResourceGroupName -StorageAccountName $SQL_StorageAccountName `
+        $status = Update-SqlIaaSExtensionKeyVault -resourceGroupName $ResourceGroupName `
                     -VMName $VMName -autoBackupPassword $AutoBackupPassword `
                     -KeyVaultServicePrincipalName $SQL_aadappguidString -KeyVaultServicePrincipalSecret $SQL_aadClientSecret `
-                    -KeyVaultCredentialName $KeyVaultCredentialName
+                    -KeyVaultCredentialName $KeyVaultCredentialName -KeyVaultKeyName $KeyVaultKeyName
 
         if($status -ne $true)
         {
-            echo "Error updating SqlIaaSExtension automatic backup and keyvault integration."
+            echo "Error updating SqlIaaSExtension keyvault integration."
             logerror
             Break
         }
@@ -649,6 +676,9 @@ else {
         $OptionalParametersPayload['sqlServerAddress'] =  $SqlServerAddress
         $OptionalParametersPayload['adminUserName'] = $AdminUserName
         $OptionalParametersPayload['vmName'] = $VMName
+        $OptionalParametersPayload['sqlCredentialName'] = $KeyVaultCredentialName
+        $OptionalParametersPayload['sqlKeyVaultKeyName'] = $KeyVaultKeyName
+
 
         $TemplateFile = '.\templates\WindowsSQLVirtualMachinePayload.json'
         $TemplateFile = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($PSScriptRoot, $TemplateFile))

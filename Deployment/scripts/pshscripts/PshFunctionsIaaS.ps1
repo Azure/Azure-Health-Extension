@@ -189,7 +189,6 @@ Function Update-AccessPolicySqlFunction {
         return $false
     }
 
-
     log "VM MSI ApplicationId $($VM.Identity.PrincipalId)"
 
     #
@@ -234,6 +233,9 @@ Function Update-AccessPolicySqlFunction {
         log "VM MSI already a member of group."
     }
 
+    # disconnect azureAD
+    $null = Disconnect-AzureAD
+
     #
     # enable AD based administrator
     #
@@ -245,19 +247,16 @@ Function Update-AccessPolicySqlFunction {
         Break
     }
 
-	$CurrentAdmin = Get-AzureRmSqlServerActiveDirectoryAdministrator -ResourceGroupName $sqlDbServerResourceGroup -ServerName $sqlDbServerName -ErrorAction SilentlyContinue
+    $CurrentAdmin = Get-AzureRmSqlServerActiveDirectoryAdministrator -ResourceGroupName $sqlDbServerResourceGroup -ServerName $sqlDbServerName -ErrorAction SilentlyContinue
 
-	if(($CurrentAdmin -eq $null) -Or
-	   ($CurrentAdmin.ObjectId -ne $user[0].Id))
-	{
-		log "Enabling SQL AD administrator user = $($accountId)."
-	    $null = Set-AzureRmSqlServerActiveDirectoryAdministrator -ResourceGroupName $sqlDbServerResourceGroup -ServerName $sqlDbServerName -DisplayName $user[0].DisplayName
-	} else {
-		log "User already SQL AD administrator."
-	}
-
-    # disconnect azureAD
-    $null = Disconnect-AzureAD
+    if(($CurrentAdmin -eq $null) -Or
+       ($CurrentAdmin.ObjectId -ne $user[0].Id))
+    {
+        log "Enabling SQL AD administrator user = $($accountId)."
+        $null = Set-AzureRmSqlServerActiveDirectoryAdministrator -ResourceGroupName $sqlDbServerResourceGroup -ServerName $sqlDbServerName -DisplayName $user[0].DisplayName
+    } else {
+        log "User already SQL AD administrator."
+    }
 
 
     #
@@ -301,11 +300,9 @@ Function Update-AccessPolicySqlFunction {
 
 <#
 .SYNOPSIS
-    This function creates a storage account for SQL backups, and then:
-    1. Updates the SQL IaaS extension backup settings,
-    2. Updates the SQL IaaS extension keyvault settings.
+    This function creates a keyvault key and updates the SQL IaaS extension keyvault settings.
 #>
-Function Update-SqlIaaSExtensionBackupAndKeyVault {
+Function Update-SqlIaaSExtensionKeyVault {
     [CmdletBinding()]
     Param(
         [Parameter(Mandatory = $true,
@@ -315,46 +312,59 @@ Function Update-SqlIaaSExtensionBackupAndKeyVault {
         [Parameter(Mandatory = $true,
             ValueFromPipelineByPropertyName = $true,
             Position = 1)]
-            [string]$StorageAccountName,
-        [Parameter(Mandatory = $true,
-            ValueFromPipelineByPropertyName = $true,
-            Position = 2)]
             [string]$VMName,
         [Parameter(Mandatory = $true,
             ValueFromPipelineByPropertyName = $true,
-            Position = 3)]
+            Position = 2)]
             [securestring]$autoBackupPassword,
         [Parameter(Mandatory = $true,
             ValueFromPipelineByPropertyName = $true,
-            Position = 4)]
+            Position = 3)]
             [string]$KeyVaultServicePrincipalName,
         [Parameter(Mandatory = $true,
             ValueFromPipelineByPropertyName = $true,
-            Position = 5)]
+            Position = 4)]
             [securestring]$KeyVaultServicePrincipalSecret,
         [Parameter(Mandatory = $true,
             ValueFromPipelineByPropertyName = $true,
+            Position = 5)]
+            [string]$KeyVaultCredentialName,
+        [Parameter(Mandatory = $true,
+            ValueFromPipelineByPropertyName = $true,
             Position = 6)]
-            [string]$KeyVaultCredentialName
+            [string]$KeyVaultKeyName
     )
 
-    $StorageAccount = Get-AzureRmStorageAccount -ResourceGroup $resourceGroupName -Name $StorageAccountName -ErrorAction SilentlyContinue
+    $vaultName = $resourceGroupName+'-sql-kv'
 
-    if($StorageAccount -eq $null)
+    $CredentialAlreadyExists = $false
+
+    $ExtensionSettings = Get-AzureRmVMSqlServerExtension -ResourceGroupName $resourceGroupName -VMName $VMName
+    
+    if($ExtensionSettings.KeyVaultCredentialSettings.Enable -eq $true)
     {
-        log "Failed to get existing SQL backup storage account."
-        logerror
-        Break
-    } else {
-        log "Using existing SQL backup storage account."
+        $Credentials = $ExtensionSettings.KeyVaultCredentialSettings.Credentials
+
+        $Credentials | ForEach-Object {
+            if( ($_.CredentialName -eq $KeyVaultCredentialName) -And
+                ($_.KeyVaultName -eq $vaultName) )
+            {
+                $CredentialAlreadyExists = $true
+            }
+        }
     }
 
-    $AutoBackupSettings = New-AzureRmVMSqlServerAutoBackupConfig -Enable -EnableEncryption `
-            -RetentionPeriodInDays 30 -StorageContext $StorageAccount.Context -ResourceGroupName $resourceGroupName `
-            -BackupSystemDbs -BackupScheduleType Automated -FullBackupFrequency Weekly -CertificatePassword $autoBackupPassword
+    if($CredentialAlreadyExists -eq $true)
+    {
+        log "SQL vault credential configured and already matches, skipping IaaS extension update."
+        return $true
+    }
 
+    log "Adding new key $($KeyVaultKeyName) to $($vaultName) keyvault."
 
-    $KeyVaultUrl = "https://$($resourceGroupName)-sql-kv.vault.azure.net/"
+    $null = Add-AzureKeyVaultKey -VaultName $vaultName -Name $KeyVaultKeyName -Destination 'HSM' -KeyOps wrapKey,unwrapKey
+
+    $KeyVaultUrl = "https://$($vaultName).vault.azure.net/"
 
     $KeyVaultCredentialSettings = New-AzureRmVMSqlServerKeyVaultCredentialConfig -ResourceGroupName $resourceGroupName `
                                      -Enable `
@@ -364,15 +374,25 @@ Function Update-SqlIaaSExtensionBackupAndKeyVault {
                                      -ServicePrincipalSecret $KeyVaultServicePrincipalSecret
     
 
-    log "Updating SqlIaaSExtension to enable automatic backups and keyvault integration."
+    log "Updating SqlIaaSExtension to enable keyvault integration."
     $ExtensionStatus = Set-AzureRmVMSqlServerExtension -ResourceGroupName $resourceGroupName -VMName $VMName `
-        -AutoBackupSettings $AutoBackupSettings -KeyVaultCredentialSettings $KeyVaultCredentialSettings
+        -KeyVaultCredentialSettings $KeyVaultCredentialSettings
 
-    if($ExtensionStatus.IsSuccessStatusCode -eq $true)
+    if($ExtensionStatus.IsSuccessStatusCode -ne $true)
     {
-        log "Sucessfully updated SqlIaasExtension"
-        $true
-    } else {
-        $false
+        log "Failed to update SQL IaaS extension KeyVault configuration."
+        return $false
     }
+
+    log "Successfully updated SQL IaaS extension KeyVault configuration."
+
+    #
+    # note: the deployment script should be updated to use recent RM powershell extensions.
+    # At that point, the virtualnetwork configuration can be locked down to the same VNET as used for storage accounts.
+    #
+    # Add-AzureRmKeyVaultNetworkRule -VirtualNetworkResourceId
+    # Update-AzureRmKeyVaultNetworkRuleSet -DefaultAction Deny
+    #
+
+    return $true
 }

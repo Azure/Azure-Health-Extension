@@ -31,6 +31,18 @@
       "metadata": {
         "description": "PaaS Sql Server address."
       }
+    },
+    "sqlCredentialName": {
+      "type": "string",
+      "metadata": {
+        "description": "Credential name associated with AAD service principal for SQL keyvault access."
+      }
+    },
+    "sqlKeyVaultKeyName": {
+      "type": "string",
+      "metadata": {
+        "description": "Key name in keyvault to support SQL AKV integration."
+      }
     }
   },
   "variables": {
@@ -60,7 +72,7 @@
           ]
         },
         "protectedSettings": {
-          "commandToExecute": "[concat('powershell -ExecutionPolicy Unrestricted -File ', variables('powershellFileName'), ' -adminUserName ', parameters('adminUserName'), ' -payloadFileName ', variables('payloadFileName'), ' -sqlServerAddress ', parameters('sqlServerAddress'))]"
+          "commandToExecute": "[concat('powershell -ExecutionPolicy Unrestricted -File ', variables('powershellFileName'), ' -adminUserName ', parameters('adminUserName'), ' -payloadFileName ', variables('payloadFileName'), ' -sqlServerAddress ', parameters('sqlServerAddress'), ' -sqlCredentialName ', parameters('sqlCredentialName'), ' -sqlKeyVaultKeyName ', parameters('sqlKeyVaultKeyName'))]"
         }
       }
     }
