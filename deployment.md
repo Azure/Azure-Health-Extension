@@ -20,10 +20,15 @@ installed.
 
 ## Deploy the solution
 
-You need to copy, or [clone](https://help.github.com/articles/cloning-a-repository/) the repository. Once you have a copy of the  Blueprint automation, you can deploy the solution by using the  **deploy.ps1** PowerShell script that deploys or manages the  Blueprint.
+You need to copy, or [clone](https://help.github.com/articles/cloning-a-repository/) the repository. Once you have a copy of the  Blueprint automation, you can deploy the solution by using the  **deploy.ps1** PowerShell script in ADMIN mode that deploys or manages the  Blueprint.
 
+## Required administrator roles
 
-Once the repository has been copied, or cloned change your working directory to
+The person installing the blueprint must be in the Global Administrator role in the AAD. The installing account must also be an Azure subscription administrator for the subscription being used. If the person doing the install is not in both of these roles, the install will fail.
+
+Further, the install is not designed to work with MSDN subscriptions due to the tight integration with AAD. A standard Azure account must be used. If needed, get a [free trial](https://azure.microsoft.com/en-us/free/?WT.mc_id=ms-docs-dastarr) with credit to spend for installing the blueprint solution and running its demos.
+
+1.  Once the repository has been copied, or cloned change your working directory to
     **Deployment**:
 ```
 cd  .\Deployment\
@@ -35,19 +40,19 @@ cd  .\Deployment\
 ```
 .\deploy.ps1 -installModules
 ```
-- It is recommended that if an error is flagged during deployment, that the errors be resolved prior to proceeding.
-- Time to deploy the solution will be approximately 25 minutes.
+  - It is recommended that if an error is flagged during deployment, that the errors be resolved prior to proceeding.
+  - Time to deploy the solution will be approximately 25 minutes.
 
 3.  Once the modules are installed, run **deploy.ps1** again to deploy
     the solution. For detailed usage instructions, see **deploy.ps1 usage**
 
-- NOTE: The script asks you to supply a value for the
+   - NOTE: The script asks you to supply a value for the
 **globalAdminPassword** parameter; enter the password for the
 administrative account you are using for the **-globalAdminUsername**
 parameter. The script then deploys the solution, which may take some
 time, monitoring the 30 minute deployment is recommended, since during the deployment Global username, and Password pop up dialog windows will appear.
 
-- The script will be complete when the results of the **\\deployment\\output\\\<deployment-prefix\>-deploymentOutput.json** displayed onscreen.
+   - The script will be complete when the results of the **\\deployment\\output\\\<deployment-prefix\>-deploymentOutput.json** displayed onscreen.
 
 ##  deploy.ps1 usage
 
@@ -77,9 +82,9 @@ This command deploys the solution and sets a single common password for all solu
 
 **Example 3: Deploying the IaaS based extention**
 This capabilitiy has been added to the solution as to show-case best practices and possible approaches following scenarios:
-1.	Extend the existing PaaS sample to show secure co-existence between PaaS and IaaS VM work-load elements.
-2.	“Start Secure” – enable security capabilities and monitoring of the IaaS VM work-load before any sensitive data or work-load processing takes place.
-3.	Illustrate  recently introduced security and deployment capabilities features of ASC.
+  1.	Extend the existing PaaS sample to show secure co-existence between PaaS and IaaS VM work-load elements.
+  2.	“Start Secure” – enable security capabilities and monitoring of the IaaS VM work-load before any sensitive data or work-load processing takes place.
+  3.	Illustrate  recently introduced security and deployment capabilities features of ASC.
 
 
 
@@ -112,9 +117,16 @@ DeployIaaS.ps1 should be run once the deployment of the solution has been comple
 ```
 This command deploys the IaaS solution for testing purposes.
 
+## Sample Example
+```
+.\deploy.ps1 -deploymentPrefix <prefix> [Any max 5 length prefix e.g. demo1, test99, etc]
+             -tenantId <tenant-id> [“XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX”] 
+             -tenantDomain <tenant-domain> [“XXXXXXXX.com”]
+             -subscriptionId <subscription-id> [XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX]
+             -globalAdminUsername <username> [Pass provided Username, if any]
+             -deploymentPassword <password> [Pass any random strong password that you want to set for AAD user accounts that will be created during deployment.]
 
-
-
+```
 ## Parameters
 
 All parameters are optional, although at least one parameter must be
@@ -211,6 +223,16 @@ Subscriptions such as BizSpark, where there is a spending limit, the use of opti
 ```
 -appInsightsPlan 2
 ```
+# Description of files specific to the IaaS extension
+
+1. deployIaaS.ps1 - Deployment script for IaaS extension.   Executed after PaaS deploy.ps1 has completed execution.  Includes code to setup resource group, service identities and AD configuration, keyvault key for SQL TDE, and templates deployment.
+2. scripts\pshscripts\PshFunctionsIaaS.ps1 - Powershell deployment script helper routines:  1) Preparation of SQL VM payload artifacts (sample data set, and code to install it). 2) Code to setup MSI access to SQL PaaS instance, and configure firewall, 3) code to create azure key vault key for SQL TDE, and update SQL IaaS extension configuration.
+3. templates\WindowsSqlVirtualMachine.json - ARM template which does SQL VM deployment, creates keyvaults, and configures several VM extensions.
+4. templates\WindowsSqlVirtualMachinePayload.json - ARM template which uses CustomScriptExtension to execute and report status of sql-setup.ps1, within the Sql IaaS VM.
+5. stage\sql-setup.ps1 - Powershell code that executes on the SQL VM, which resets the adminstrator credential to a new random value, and then configures SQL TDE with keyvault integration, imports sample data set, and executes query against PaaS SQL instance using managed service identity (MSI) for authentication.  See comments at the top of sql-setup.ps1 file for more info.
+6. stage\artifact\LengthOfStay-IaaSDemo.csv - Sample data set, imported to SQL IaaS instance.
+7. stage\artifact\patientdb_schema_nolos.sql - Schema associated with LengthOfStay-IaasDemo dataset.
+8. stage\artifact\sql-setup-functions.ps1 - Helper function used by sql-setup.ps1 to facilitate administrator impersonation.
 
 
 ## Grant permissions in Azure Active Directory
@@ -575,4 +597,6 @@ John Doyle (WW Health Industry Microsoft)
 Scott Feild (Azure Core Security)
 
 Frank Simorjay (Azure Core Security)
+
+Rajeev Rangappa ( Azure Global)
 

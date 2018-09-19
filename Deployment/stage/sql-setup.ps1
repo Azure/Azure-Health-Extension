@@ -4,13 +4,15 @@
     1. Unzips provisioning payload.
     2. Resets the administrator password to a new random value.
     3. Impersonates local administrator account, for access to local SQL instance.
-    4. Imports CSV dataset into local SQL instance.
+    4. Enables TDE using azure key vault integration, and then imports CSV dataset into local SQL instance.
     5. Obtains managed service identity (MSI) VM access token.
     6. Queries SQL PaaS instance dataset, authenticated as MSI, noting returned row count.
     7. Summarizes results, to local file and substatuses output.
 #>
 
-Param ( [string] $adminUserName, [string] $payloadFileName, [string] $sqlServerAddress )
+
+
+Param ( [string] $adminUserName, [string] $payloadFileName, [string] $sqlServerAddress, [string] $sqlCredentialName, [string] $sqlKeyVaultKeyName )
     $StartDate = Get-Date
     $scriptRoot = Get-Location
     $nodeName = $env:computername
@@ -20,6 +22,8 @@ Param ( [string] $adminUserName, [string] $payloadFileName, [string] $sqlServerA
     echo $adminUserName >> payloadlog.txt
     echo $payloadFileName >> payloadlog.txt
     echo $sqlServerAddress >> payloadlog.txt
+    echo $sqlCredentialName >> payloadlog.txt
+    echo $sqlKeyVaultKeyName >> payloadlog.txt
     echo $scriptRoot.Path >> payloadlog.txt
 
     #
@@ -79,9 +83,62 @@ Param ( [string] $adminUserName, [string] $payloadFileName, [string] $sqlServerA
         exit 3
     }
 
-    $LocalSqlSetup = $false
+    # queries to create patientdb and enable TDE using AKV integration.
+
+    $DomainUsername = "$($domain)\$($username)"
+    $KeyVaultKeyName = "'$sqlKeyVaultKeyName'"
+
+    $querysetupTDE =@"
+    USE master;
+
+    if db_id('patientdb') is null
+    CREATE DATABASE patientdb;	-- create patientdb, as it doesn't exist
+
+    -- this query can be executed repeatedly for a given deployment, so only execute the encryption enable steps once
+    IF EXISTS (SELECT * FROM sys.dm_database_encryption_keys WHERE (database_id = db_id('patientdb') AND encryption_state != 0))
+    SET NOEXEC ON;	-- the database exists and is already encrypted/pending encryption, nothing more to do.
+    
+    ALTER LOGIN [$DomainUsername]  
+    ADD CREDENTIAL $sqlCredentialName;	-- add AAD credential to admin login, to allow connection to keyvault
+    GO
+
+    CREATE ASYMMETRIC KEY TDE_KEY		-- create TDE key, protected by keyvault backed key  
+    FROM PROVIDER [AzureKeyVault_EKM_Prov]  
+    WITH PROVIDER_KEY_NAME = $KeyVaultKeyName,  
+    CREATION_DISPOSITION = OPEN_EXISTING;
+    GO
+
+    ALTER LOGIN [$DomainUsername]  
+    DROP CREDENTIAL $sqlCredentialName;	-- remove AAD credential from admin login.
+    GO
+
+    IF NOT EXISTS (SELECT name FROM master.sys.server_principals WHERE name = 'TDE_Login')
+    BEGIN
+    CREATE LOGIN TDE_Login   
+    FROM ASYMMETRIC KEY TDE_KEY;
+    END
+
+    ALTER LOGIN TDE_Login   
+    ADD CREDENTIAL $sqlCredentialName;	-- add AAD credential to TDE_Login, to allow connection to keyvault
+    GO 
+
+    -- enable encryption on patientdb
+    USE patientdb;
+    GO
+
+    CREATE DATABASE ENCRYPTION KEY   
+    WITH ALGORITHM = AES_256   
+    ENCRYPTION BY SERVER ASYMMETRIC KEY TDE_KEY;  
+    GO
+
+    ALTER DATABASE patientdb
+    SET ENCRYPTION ON;
+    GO  
+    SET NOEXEC OFF;
+"@
 
     $query = "BULK INSERT [dbo].[PatientData] FROM '$csvArtifactFile' WITH (FIRSTROW = 2, FIELDTERMINATOR = ',', ROWTERMINATOR = '\n')"
+    $LocalSqlSetup = $false
 
     try {
         ($hToken, $fSuccess) = LogonUser -UserName $username -Domain $domain -Password $password
@@ -94,10 +151,17 @@ Param ( [string] $adminUserName, [string] $payloadFileName, [string] $sqlServerA
 
         ($IdentityContext) = ImpersonateLoggedOnUser -hToken $hToken
 
+        # setup patientDB and enable SQL TDE
+        Invoke-SqlCmd -ConnectionString 'Server=localhost;Integrated Security=SSPI;Persist Security Info=False;'  -Query $querysetupTDE -OutputSqlErrors $true
+        echo "patientdb created, TDE enabled." >> payloadlog.txt
+
         # setup database schema:
-        Invoke-Sqlcmd -ConnectionString 'Server=localhost;Integrated Security=SSPI;Persist Security Info=False;' -InputFile $schemaFile -QueryTimeout 60 -OutputSqlErrors $true
+        Invoke-Sqlcmd -ConnectionString 'Server=localhost;Initial Catalog=patientdb;Integrated Security=SSPI;Persist Security Info=False;' -InputFile $schemaFile -QueryTimeout 60 -OutputSqlErrors $true
+        echo "patientdb schema configured." >> payloadlog.txt
+
         # import data
-        Invoke-SqlCmd -ConnectionString 'Server=localhost;Integrated Security=SSPI;Persist Security Info=False;'  -Query $query -OutputSqlErrors $true
+        Invoke-SqlCmd -ConnectionString 'Server=localhost;Initial Catalog=patientdb;Integrated Security=SSPI;Persist Security Info=False;'  -Query $query -OutputSqlErrors $true
+        echo "patientdb data imported." >> payloadlog.txt
 
         $LocalSqlSetup = $true
     } catch [System.Exception]

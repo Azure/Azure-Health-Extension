@@ -142,6 +142,7 @@ Function Update-AccessPolicySqlFunction {
     )
 
     $status = $false
+    $setAdministrator = $false
 
     $SubnetName = 'SQLSubnet'
     $VNetRuleName = 'SQL_IaaS_Access'
@@ -189,7 +190,6 @@ Function Update-AccessPolicySqlFunction {
         return $false
     }
 
-
     log "VM MSI ApplicationId $($VM.Identity.PrincipalId)"
 
     #
@@ -234,65 +234,132 @@ Function Update-AccessPolicySqlFunction {
         log "VM MSI already a member of group."
     }
 
+    # disconnect azureAD
+    $null = Disconnect-AzureAD
+
     #
     # enable AD based administrator
     #
 
-    $user = Get-AzureRMADUser -SearchString $accountId
-    if( (($user | measure).count) -ne 1 ) {
-        log "Unable to determine administrator identity information."
-        logerror 
+    # get user ObjectId associated with current azure context.
+
+    $cache = $currentAzureContext.TokenCache
+    $token = $cache.ReadItems() | Where-Object { $_.TenantId -eq $currentAzureContext.Tenant.TenantId -And $_.DisplayableId -eq $currentAzureContext.Account.Id }
+
+    if($token -eq $null) {
+        log "Unable to determine current user objectId information."
+        logerror
         Break
     }
 
-	$CurrentAdmin = Get-AzureRmSqlServerActiveDirectoryAdministrator -ResourceGroupName $sqlDbServerResourceGroup -ServerName $sqlDbServerName -ErrorAction SilentlyContinue
+    $accountObjectId = $token[0].UniqueId
 
-	if(($CurrentAdmin -eq $null) -Or
-	   ($CurrentAdmin.ObjectId -ne $user[0].Id))
-	{
-		log "Enabling SQL AD administrator user = $($accountId)."
-	    $null = Set-AzureRmSqlServerActiveDirectoryAdministrator -ResourceGroupName $sqlDbServerResourceGroup -ServerName $sqlDbServerName -DisplayName $user[0].DisplayName
-	} else {
-		log "User already SQL AD administrator."
-	}
+    $CurrentAdmin = Get-AzureRmSqlServerActiveDirectoryAdministrator -ResourceGroupName $sqlDbServerResourceGroup -ServerName $sqlDbServerName -ErrorAction SilentlyContinue
 
-    # disconnect azureAD
-    $null = Disconnect-AzureAD
+    if(($CurrentAdmin -eq $null) -Or
+       ($CurrentAdmin.ObjectId -ne $accountObjectId))
+    {
+        log "Enabling SQL AD administrator user = $($accountId)."
+        $null = Set-AzureRmSqlServerActiveDirectoryAdministrator -ResourceGroupName $sqlDbServerResourceGroup -ServerName $sqlDbServerName -ObjectId $accountObjectId -DisplayName $accountId
+
+        $setAdministrator = $true
+    } else {
+        log "User already SQL AD administrator."
+    }
 
 
     #
     # setup access to group containing MSI, and grant db_datareader access.
     #
 
+    # obtain AAD token for https://database.windows.net/
+    #
+
+    $TenantId = $currentAzureContext.Tenant.TenantId
+    $resource = "https://database.windows.net/" 
+    $authUrl = "https://login.windows.net/$TenantId/" 
+    $ClientId = "1950a258-227b-4e31-a9cf-717495945fc2"
+    $authContext = [Microsoft.IdentityModel.Clients.ActiveDirectory.AuthenticationContext]::new($authUrl, $false) 
+
+    # UserIdentifier enum
+    # 0 = UniqueId
+    # 2 = RequiredDisplayableId
+    $userid = New-Object Microsoft.IdentityModel.Clients.ActiveDirectory.UserIdentifier($accountObjectId, 0)
+    $authResult = $authContext.AcquireTokenSilentAsync($resource, $ClientId, $userid)
+
+    if($authResult.Result -eq $null)
+    {
+        $redirect = 'urn:ietf:wg:oauth:2.0:oob'
+        $authResult = $authContext.AcquireToken($resource, $ClientId, $redirect, 0, $userid)
+        if($authResult -eq $null)
+        {
+            log "Unable to obtain AAD user auth token for current azure context."
+            logerror
+            Break
+        }
+    } else {
+        $authResult = $authResult.Result
+    }
+
     $SqlServerAddress = $SqlDbServerName +'.database.windows.net'
 
-    $connectionString = "Server=tcp:$($SqlServerAddress),1433;Initial Catalog=patientdb;Persist Security Info=False;MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Authentication=Active Directory Integrated;"
-    log "$connectionString"
+    $SqlConnection = New-Object System.Data.SqlClient.SqlConnection
+    $SqlConnection.ConnectionString = "Server=tcp:$($SqlServerAddress),1433;Initial Catalog=patientdb;Persist Security Info=False;MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Integrated Security=False;Connection Timeout=15;"
+    $SqlConnection.AccessToken = $authResult.AccessToken
+
+    $SqlConnection.Open()
+
+    $SqlCmd = New-Object System.Data.SqlClient.SqlCommand
+    $SqlCmd.Connection = $SqlConnection
+    $SqlAdapter = New-Object System.Data.SqlClient.SqlDataAdapter
+    $SqlAdapter.SelectCommand = $SqlCmd
+    $DataSet = New-Object System.Data.DataSet
 
     #
-    # only make changes if necessary
+    # only make changes if necessary during both SQL queries
     #
 
     $queryCreateUser = "IF DATABASE_PRINCIPAL_ID('$GroupName') IS NULL BEGIN CREATE USER [$GroupName] FROM EXTERNAL PROVIDER END"
-    $queryAlterRole = "IF IS_ROLEMEMBER ( 'db_datareader','$GroupName' ) = 0 BEGIN ALTER ROLE db_datareader ADD MEMBER [$GroupName] END"
+
+    $SqlCmd.CommandText = $queryCreateUser
 
     log "Executing SQL PaaS CREATE USER for VM MSI"
 
     try {
-        $result = Invoke-SqlCmd -ConnectionString $connectionString -Query $queryCreateUser -OutputSqlErrors $true
+        $rowCount = $SqlAdapter.Fill($DataSet)
+        log "Sucessfully issued CREATE USER for VM MSI."
     } catch {
         log "Caught exception during CREATE USER"
         Write-Error -Message $_.Exception.Message
     }
 
+    $queryAlterRole = "IF IS_ROLEMEMBER ( 'db_datareader','$GroupName' ) = 0 BEGIN ALTER ROLE db_datareader ADD MEMBER [$GroupName] END"
+
+    $SqlCmd.CommandText = $queryAlterRole
+
     log "Executing SQL PaaS ALTER ROLE for VM MSI"
     try {
-        $result = Invoke-SqlCmd -ConnectionString $connectionString -Query $queryAlterRole -OutputSqlErrors $true
+        $rowCount = $SqlAdapter.Fill($DataSet)
         log "Sucessfully updated PaaS firewall and MSI access policy."
         $status = $true
     } catch {
         log "caught exception during ALTER ROLE"
         Write-Error -Message $_.Exception.Message
+    }
+
+    $SqlConnection.Close()
+
+    if( ($setAdministrator -eq $true) )
+    {
+        if($CurrentAdmin -eq $null) {
+            log "Removing PaaS SqlServer Ad Admin - returning to original value."
+            $null = Remove-AzureRmSqlServerActiveDirectoryAdministrator -ResourceGroupName $sqlDbServerResourceGroup -ServerName $sqlDbServerName
+        } else {
+            if($CurrentAdmin.ObjectId -ne $accountObjectId) {
+                log "Resetting PaaS SqlServer Ad Admin to original value."
+                $null = Set-AzureRmSqlServerActiveDirectoryAdministrator -ResourceGroupName $sqlDbServerResourceGroup -ServerName $sqlDbServerName -DisplayName $CurrentAdmin.DisplayName -ObjectId $CurrentAdmin.ObjectId
+            }
+        }
     }
 
     $status
@@ -301,11 +368,9 @@ Function Update-AccessPolicySqlFunction {
 
 <#
 .SYNOPSIS
-    This function creates a storage account for SQL backups, and then:
-    1. Updates the SQL IaaS extension backup settings,
-    2. Updates the SQL IaaS extension keyvault settings.
+    This function creates a keyvault key and updates the SQL IaaS extension keyvault settings.
 #>
-Function Update-SqlIaaSExtensionBackupAndKeyVault {
+Function Update-SqlIaaSExtensionKeyVault {
     [CmdletBinding()]
     Param(
         [Parameter(Mandatory = $true,
@@ -315,46 +380,59 @@ Function Update-SqlIaaSExtensionBackupAndKeyVault {
         [Parameter(Mandatory = $true,
             ValueFromPipelineByPropertyName = $true,
             Position = 1)]
-            [string]$StorageAccountName,
-        [Parameter(Mandatory = $true,
-            ValueFromPipelineByPropertyName = $true,
-            Position = 2)]
             [string]$VMName,
         [Parameter(Mandatory = $true,
             ValueFromPipelineByPropertyName = $true,
-            Position = 3)]
+            Position = 2)]
             [securestring]$autoBackupPassword,
         [Parameter(Mandatory = $true,
             ValueFromPipelineByPropertyName = $true,
-            Position = 4)]
+            Position = 3)]
             [string]$KeyVaultServicePrincipalName,
         [Parameter(Mandatory = $true,
             ValueFromPipelineByPropertyName = $true,
-            Position = 5)]
+            Position = 4)]
             [securestring]$KeyVaultServicePrincipalSecret,
         [Parameter(Mandatory = $true,
             ValueFromPipelineByPropertyName = $true,
+            Position = 5)]
+            [string]$KeyVaultCredentialName,
+        [Parameter(Mandatory = $true,
+            ValueFromPipelineByPropertyName = $true,
             Position = 6)]
-            [string]$KeyVaultCredentialName
+            [string]$KeyVaultKeyName
     )
 
-    $StorageAccount = Get-AzureRmStorageAccount -ResourceGroup $resourceGroupName -Name $StorageAccountName -ErrorAction SilentlyContinue
+    $vaultName = $resourceGroupName+'-sql-kv'
 
-    if($StorageAccount -eq $null)
+    $CredentialAlreadyExists = $false
+
+    $ExtensionSettings = Get-AzureRmVMSqlServerExtension -ResourceGroupName $resourceGroupName -VMName $VMName
+    
+    if($ExtensionSettings.KeyVaultCredentialSettings.Enable -eq $true)
     {
-        log "Failed to get existing SQL backup storage account."
-        logerror
-        Break
-    } else {
-        log "Using existing SQL backup storage account."
+        $Credentials = $ExtensionSettings.KeyVaultCredentialSettings.Credentials
+
+        $Credentials | ForEach-Object {
+            if( ($_.CredentialName -eq $KeyVaultCredentialName) -And
+                ($_.KeyVaultName -eq $vaultName) )
+            {
+                $CredentialAlreadyExists = $true
+            }
+        }
     }
 
-    $AutoBackupSettings = New-AzureRmVMSqlServerAutoBackupConfig -Enable -EnableEncryption `
-            -RetentionPeriodInDays 30 -StorageContext $StorageAccount.Context -ResourceGroupName $resourceGroupName `
-            -BackupSystemDbs -BackupScheduleType Automated -FullBackupFrequency Weekly -CertificatePassword $autoBackupPassword
+    if($CredentialAlreadyExists -eq $true)
+    {
+        log "SQL vault credential configured and already matches, skipping IaaS extension update."
+        return $true
+    }
 
+    log "Adding new key $($KeyVaultKeyName) to $($vaultName) keyvault."
 
-    $KeyVaultUrl = "https://$($resourceGroupName)-sql-kv.vault.azure.net/"
+    $null = Add-AzureKeyVaultKey -VaultName $vaultName -Name $KeyVaultKeyName -Destination 'HSM' -KeyOps wrapKey,unwrapKey
+
+    $KeyVaultUrl = "https://$($vaultName).vault.azure.net/"
 
     $KeyVaultCredentialSettings = New-AzureRmVMSqlServerKeyVaultCredentialConfig -ResourceGroupName $resourceGroupName `
                                      -Enable `
@@ -364,15 +442,25 @@ Function Update-SqlIaaSExtensionBackupAndKeyVault {
                                      -ServicePrincipalSecret $KeyVaultServicePrincipalSecret
     
 
-    log "Updating SqlIaaSExtension to enable automatic backups and keyvault integration."
+    log "Updating SqlIaaSExtension to enable keyvault integration."
     $ExtensionStatus = Set-AzureRmVMSqlServerExtension -ResourceGroupName $resourceGroupName -VMName $VMName `
-        -AutoBackupSettings $AutoBackupSettings -KeyVaultCredentialSettings $KeyVaultCredentialSettings
+        -KeyVaultCredentialSettings $KeyVaultCredentialSettings
 
-    if($ExtensionStatus.IsSuccessStatusCode -eq $true)
+    if($ExtensionStatus.IsSuccessStatusCode -ne $true)
     {
-        log "Sucessfully updated SqlIaasExtension"
-        $true
-    } else {
-        $false
+        log "Failed to update SQL IaaS extension KeyVault configuration."
+        return $false
     }
+
+    log "Successfully updated SQL IaaS extension KeyVault configuration."
+
+    #
+    # note: the deployment script should be updated to use recent RM powershell extensions.
+    # At that point, the virtualnetwork configuration can be locked down to the same VNET as used for storage accounts.
+    #
+    # Add-AzureRmKeyVaultNetworkRule -VirtualNetworkResourceId
+    # Update-AzureRmKeyVaultNetworkRuleSet -DefaultAction Deny
+    #
+
+    return $true
 }
